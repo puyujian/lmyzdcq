@@ -38,7 +38,13 @@ Dockerfile
 
 ## 启动
 
-先修改 `docker-compose.yml` 里的这些配置：
+先复制一份环境变量模板：
+
+```bash
+cp .env.example .env
+```
+
+然后修改 `.env` 里的这些配置：
 
 - `API_TOKEN`
 - `LAZYCAT_EMAIL`
@@ -125,10 +131,10 @@ POST
 字段填写说明：
 
 - `https://your-domain-url`：替换成你的服务域名，或者 `http://服务器IP:端口`
-- `{{API_KEY}}`：替换成 `docker-compose.yml` 里的 `API_TOKEN`
+- `{{API_KEY}}`：替换成 `.env` 里的 `API_TOKEN`
 - `{{CONTENT}}`：建议传 `offline`、`down`、`off`、`shutdown`、`stopped`、`powered_off` 这些值之一
 - `{{FROM}}`：替换成告警来源，比如 `uptime-kuma`、`zabbix`、`webhook`
-- `instance_name`：替换成懒猫云里这台 VPS 的主机名；如果当前只有一台，也可以不传，改为在 `docker-compose.yml` 里固定 `LAZYCAT_TARGET_HOSTNAME`
+- `instance_name`：替换成懒猫云里这台 VPS 的主机名；如果当前只有一台，也可以不传，改为在 `.env` 里固定 `LAZYCAT_TARGET_HOSTNAME`
 
 一个完整可直接用的示例：
 
@@ -153,7 +159,7 @@ POST
 }
 ```
 
-如果上报里没有 `instance_name`，系统会回退到 `LAZYCAT_TARGET_HOSTNAME`。
+如果上报里没有 `instance_name`，系统会回退到 `.env` 里的 `LAZYCAT_TARGET_HOSTNAME`。
 
 触发重启的判定值包括：
 
@@ -213,7 +219,7 @@ X-Api-Token: your-token
 
 ## 兼容多实例和页面变更
 
-如果后续不止一台 VPS，或者面板按钮文案变化，可以直接在 `docker-compose.yml` 里改这些环境变量，不用改代码：
+如果后续不止一台 VPS，或者面板按钮文案变化，可以直接在 `.env` 里改这些环境变量，不用改代码：
 
 - `LAZYCAT_TARGET_HOSTNAME`
 - `LAZYCAT_SERVICE_LINK_SELECTORS`

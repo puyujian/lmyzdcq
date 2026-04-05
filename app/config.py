@@ -77,7 +77,14 @@ class Settings:
                 "LAZYCAT_ENTER_PANEL_TEXTS",
                 ("进入面板", "控制面板", "进入控制台", "Panel", "Manage Panel"),
             ),
-            enter_panel_selectors=_env_list("LAZYCAT_ENTER_PANEL_SELECTORS", tuple()),
+            enter_panel_selectors=_env_list(
+                "LAZYCAT_ENTER_PANEL_SELECTORS",
+                (
+                    "a[href*='container/dashboard']",
+                    "a[href*='dashboard?hash=']",
+                    "a[target='_blank'][href*=':8443/']",
+                ),
+            ),
             stop_button_texts=_env_list(
                 "LAZYCAT_STOP_BUTTON_TEXTS",
                 ("停止", "关机", "Shutdown", "Stop", "Power Off"),

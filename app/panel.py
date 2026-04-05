@@ -5,9 +5,13 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Iterable
+from urllib.parse import parse_qs
+from urllib.parse import urljoin
+from urllib.parse import urlparse
 
 from playwright.async_api import Locator
 from playwright.async_api import Page
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
@@ -19,6 +23,58 @@ LOGGER = logging.getLogger(__name__)
 class LazyCatPanelClient:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+
+    async def inspect_instance(self, instance_name: str | None = None) -> dict[str, object]:
+        self._settings.artifact_dir.mkdir(parents=True, exist_ok=True)
+        self._settings.storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                headless=self._settings.playwright_headless,
+                args=["--disable-dev-shm-usage", "--no-sandbox"],
+            )
+            context = await browser.new_context(**self._build_context_options())
+            context.set_default_timeout(self._settings.browser_timeout_ms)
+            page = await context.new_page()
+            self._register_dialog_handler(page)
+
+            try:
+                await self._ensure_logged_in(page)
+                target_page, resolved_instance = await self._open_target_panel(
+                    page,
+                    instance_name or self._settings.lazycat_target_hostname or None,
+                )
+                stop_locator = await self._wait_for_clickable_by_rules(
+                    target_page,
+                    selectors=self._settings.stop_button_selectors,
+                    texts=self._settings.stop_button_texts,
+                    timeout_ms=5000,
+                )
+                start_locator = await self._wait_for_clickable_by_rules(
+                    target_page,
+                    selectors=self._settings.start_button_selectors,
+                    texts=self._settings.start_button_texts,
+                    timeout_ms=5000,
+                )
+                await context.storage_state(path=str(self._settings.storage_state_path))
+                screenshot = await self._capture_screenshot(target_page, f"{timestamp}-inspect")
+                return {
+                    "resolved_instance_name": resolved_instance,
+                    "detail_url": page.url,
+                    "panel_url": target_page.url,
+                    "panel_title": await target_page.title(),
+                    "has_stop_button": stop_locator is not None,
+                    "has_start_button": start_locator is not None,
+                    "panel_description": await self._describe_page(target_page),
+                    "artifact_path": screenshot,
+                }
+            except Exception:
+                await self._capture_screenshot(page, f"{timestamp}-inspect-failure")
+                raise
+            finally:
+                await context.close()
+                await browser.close()
 
     async def restart_instance(self, instance_name: str | None) -> dict[str, object]:
         if not self._settings.lazycat_email or not self._settings.lazycat_password:
@@ -68,16 +124,16 @@ class LazyCatPanelClient:
         return options
 
     async def _ensure_logged_in(self, page: Page) -> None:
-        await page.goto(self._abs_url(self._settings.lazycat_clientarea_path), wait_until="domcontentloaded")
+        await self._goto_with_retry(page, self._abs_url(self._settings.lazycat_clientarea_path))
         if await self._is_login_page(page):
             LOGGER.info("检测到登录态失效，开始重新登录。")
             await self._login(page)
-            await page.goto(self._abs_url(self._settings.lazycat_clientarea_path), wait_until="domcontentloaded")
+            await self._goto_with_retry(page, self._abs_url(self._settings.lazycat_clientarea_path))
             if await self._is_login_page(page):
                 raise RuntimeError("登录后仍停留在登录页，请检查账号密码或站点是否要求额外验证。")
 
     async def _login(self, page: Page) -> None:
-        await page.goto(self._abs_url(self._settings.lazycat_login_path), wait_until="domcontentloaded")
+        await self._goto_with_retry(page, self._abs_url(self._settings.lazycat_login_path))
         await page.locator("#emailInp").wait_for(state="visible")
         await page.locator("#emailInp").fill(self._settings.lazycat_email)
         await page.locator("#emailPwdInp").fill(self._settings.lazycat_password)
@@ -85,7 +141,7 @@ class LazyCatPanelClient:
         await self._wait_for_login_completion(page)
 
     async def _open_target_panel(self, page: Page, instance_name: str | None) -> tuple[Page, str | None]:
-        await page.goto(self._abs_url(self._settings.lazycat_clientarea_path), wait_until="domcontentloaded")
+        await self._goto_with_retry(page, self._abs_url(self._settings.lazycat_clientarea_path))
         await self._wait_for_page_settle(page)
 
         panel_page = await self._click_panel_entry_if_present(page)
@@ -93,9 +149,16 @@ class LazyCatPanelClient:
             return panel_page, instance_name
 
         resolved_instance = await self._open_instance_detail(page, instance_name)
+        if await self._is_login_page(page):
+            LOGGER.info("进入实例详情页后登录态失效，重新登录并重试实例详情。")
+            await self._ensure_logged_in(page)
+            resolved_instance = await self._open_instance_detail(page, resolved_instance or instance_name)
         panel_page = await self._click_panel_entry_if_present(page)
         if panel_page is None:
-            raise RuntimeError("已进入实例详情页，但没有找到“进入面板”按钮，请补充选择器配置。")
+            raise RuntimeError(
+                "已进入实例详情页，但没有找到“进入面板”按钮，请补充选择器配置。"
+                f" 当前页面: {await self._describe_page(page)}",
+            )
         return panel_page, resolved_instance
 
     async def _open_instance_detail(self, page: Page, instance_name: str | None) -> str | None:
@@ -107,7 +170,19 @@ class LazyCatPanelClient:
                 await self._wait_for_page_settle(page)
                 return text or instance_name
 
+        candidates = await self._collect_service_link_candidates(page)
         if instance_name:
+            matched_candidates = self._match_service_candidates(candidates, instance_name)
+            if len(matched_candidates) == 1:
+                await matched_candidates[0]["locator"].click()
+                await self._wait_for_page_settle(page)
+                return str(matched_candidates[0]["text"])
+            if len(matched_candidates) > 1:
+                raise RuntimeError(
+                    f"资源列表中匹配到多个实例名: {instance_name}。候选项: "
+                    + self._describe_candidate_labels(matched_candidates),
+                )
+
             locator = await self._wait_for_clickable_by_rules(
                 page,
                 selectors=tuple(),
@@ -115,32 +190,37 @@ class LazyCatPanelClient:
                 timeout_ms=10000,
             )
             if locator is None:
-                raise RuntimeError(f"资源列表中未找到实例名: {instance_name}")
+                raise RuntimeError(
+                    f"资源列表中未找到实例名: {instance_name}。可见实例候选: "
+                    + self._describe_candidate_labels(candidates),
+                )
             resolved_name = await self._safe_text(locator) or instance_name
             await locator.click()
             await self._wait_for_page_settle(page)
             return resolved_name
 
-        candidates = await self._collect_service_link_candidates(page)
         if len(candidates) != 1:
             raise RuntimeError(
                 "当前未配置 LAZYCAT_TARGET_HOSTNAME，且未能唯一定位实例。候选项: "
-                + ", ".join(candidate["text"] for candidate in candidates[:10]),
+                + self._describe_candidate_labels(candidates),
             )
 
         await candidates[0]["locator"].click()
         await self._wait_for_page_settle(page)
-        return candidates[0]["text"]
+        return str(candidates[0]["text"])
 
     async def _click_panel_entry_if_present(self, page: Page) -> Page | None:
-        locator = await self._find_clickable_by_rules(
+        locator = await self._wait_for_clickable_by_rules(
             page,
             selectors=self._settings.enter_panel_selectors,
             texts=self._settings.enter_panel_texts,
+            timeout_ms=10000,
         )
         if locator is None:
             return None
 
+        before_url = page.url
+        panel_target_url = await self._extract_panel_target_url(page, locator)
         before_pages = list(page.context.pages)
         await locator.click()
         await asyncio.sleep(1)
@@ -151,8 +231,34 @@ class LazyCatPanelClient:
             await self._wait_for_page_settle(panel_page)
             return panel_page
 
-        await self._wait_for_page_settle(page)
-        return page
+        if page.url != before_url:
+            await self._wait_for_page_settle(page)
+            return page
+
+        if panel_target_url is not None:
+            await self._goto_with_retry(page, panel_target_url)
+            await self._wait_for_page_settle(page)
+            return page
+
+        return None
+
+    async def _extract_panel_target_url(self, page: Page, locator: Locator) -> str | None:
+        try:
+            href = await locator.get_attribute("href")
+        except Exception:  # noqa: BLE001
+            return None
+        if not href:
+            return None
+
+        normalized = urljoin(page.url, href)
+        return normalized if self._is_panel_url(normalized) else None
+
+    def _is_panel_url(self, url: str) -> bool:
+        parsed = urlparse(urljoin(f"{self._settings.lazycat_base_url}/", url))
+        path = parsed.path.casefold()
+        if "container/dashboard" in path:
+            return True
+        return "dashboard" in path and "hash=" in parsed.query.casefold()
 
     async def _power_cycle(self, page: Page, fallback_page: Page | None = None) -> None:
         stop_locator = await self._wait_for_clickable_by_rules(
@@ -194,14 +300,14 @@ class LazyCatPanelClient:
         await self._wait_for_page_settle(page)
 
     async def _click_confirm_if_present(self, page: Page) -> None:
-        locator = await self._wait_for_clickable_by_rules(
-            page,
-            selectors=self._settings.confirm_button_selectors,
-            texts=self._settings.confirm_button_texts,
-            timeout_ms=2500,
-        )
-        if locator is not None:
+        locator = await self._wait_for_confirmation_button(page, timeout_ms=2500)
+        if locator is None:
+            return
+
+        try:
             await locator.click()
+        except PlaywrightTimeoutError as exc:
+            LOGGER.warning("确认按钮点击失败，忽略本次确认。error=%s", exc)
 
     async def _try_power_cycle_from_service_detail(self, page: Page) -> bool:
         control_button = await self._wait_for_clickable_by_rules(
@@ -285,6 +391,21 @@ class LazyCatPanelClient:
                 return None
             await asyncio.sleep(poll_interval_ms / 1000)
 
+    async def _wait_for_confirmation_button(
+        self,
+        page: Page,
+        timeout_ms: int,
+        poll_interval_ms: int = 250,
+    ) -> Locator | None:
+        deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
+        while True:
+            locator = await self._find_confirmation_button(page)
+            if locator is not None:
+                return locator
+            if asyncio.get_running_loop().time() >= deadline:
+                return None
+            await asyncio.sleep(poll_interval_ms / 1000)
+
     async def _find_first_visible_by_selector(self, page: Page, selector: str) -> Locator | None:
         for frame in page.frames:
             locator = frame.locator(selector)
@@ -317,6 +438,48 @@ class LazyCatPanelClient:
                             return candidate
         return None
 
+    async def _find_confirmation_button(self, page: Page) -> Locator | None:
+        for selector in self._settings.confirm_button_selectors:
+            locator = await self._find_first_visible_by_selector(page, selector)
+            if locator is not None:
+                return locator
+
+        confirm_names = [
+            re.escape(text.strip())
+            for text in self._settings.confirm_button_texts
+            if text.strip()
+        ]
+        if not confirm_names:
+            return None
+
+        regex = re.compile(rf"^\s*(?:{'|'.join(confirm_names)})\s*$", re.IGNORECASE)
+        modal_selectors = (
+            "[role='dialog']",
+            "[aria-modal='true']",
+            ".swal2-container",
+            ".swal2-popup",
+            ".el-message-box",
+            ".modal",
+            ".ant-modal",
+            ".layui-layer",
+            ".dialog",
+        )
+        for frame in page.frames:
+            for modal_selector in modal_selectors:
+                containers = frame.locator(modal_selector)
+                count = min(await containers.count(), 20)
+                for index in range(count):
+                    container = containers.nth(index)
+                    if not await container.is_visible():
+                        continue
+                    button = container.get_by_role("button", name=regex)
+                    button_count = await button.count()
+                    for button_index in range(button_count):
+                        candidate = button.nth(button_index)
+                        if await candidate.is_visible():
+                            return candidate
+        return None
+
     async def _collect_service_link_candidates(self, page: Page) -> list[dict[str, object]]:
         candidates: list[dict[str, object]] = []
         seen: set[tuple[str, str]] = set()
@@ -340,16 +503,47 @@ class LazyCatPanelClient:
                     continue
                 if href.startswith("javascript:"):
                     continue
-                if href.startswith("http") and not href.startswith(self._settings.lazycat_base_url):
-                    continue
-                if href.rstrip("/") in {
-                    self._settings.lazycat_base_url,
-                    self._abs_url(self._settings.lazycat_login_path),
-                    self._abs_url(self._settings.lazycat_clientarea_path),
-                }:
+                if not self._is_service_detail_href(href):
                     continue
                 candidates.append({"text": text, "href": href, "locator": locator})
         return candidates
+
+    def _match_service_candidates(
+        self,
+        candidates: list[dict[str, object]],
+        instance_name: str,
+    ) -> list[dict[str, object]]:
+        needle = instance_name.casefold()
+        return [
+            candidate
+            for candidate in candidates
+            if needle in str(candidate["text"]).casefold()
+        ]
+
+    def _describe_candidate_labels(
+        self,
+        candidates: list[dict[str, object]],
+        limit: int = 10,
+    ) -> str:
+        labels = [str(candidate["text"]) for candidate in candidates[:limit]]
+        return ", ".join(labels) if labels else "无"
+
+    def _is_service_detail_href(self, href: str) -> bool:
+        normalized = urljoin(f"{self._settings.lazycat_base_url}/", href)
+        parsed = urlparse(normalized)
+        base = urlparse(self._settings.lazycat_base_url)
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        if parsed.netloc != base.netloc:
+            return False
+
+        path = parsed.path.casefold()
+        query = {key.casefold(): values for key, values in parse_qs(parsed.query).items()}
+        if "servicedetail" in path:
+            return "id" in query or "?" in normalized
+
+        action = query.get("action", [""])[0].casefold()
+        return "clientarea" in path and action == "productdetails" and "id" in query
 
     async def _capture_screenshot(self, page: Page, name: str) -> str:
         output = self._settings.artifact_dir / f"{name}.png"
@@ -415,6 +609,47 @@ class LazyCatPanelClient:
         except PlaywrightTimeoutError:
             pass
         await asyncio.sleep(1)
+
+    async def _goto_with_retry(
+        self,
+        page: Page,
+        url: str,
+        *,
+        wait_until: str = "domcontentloaded",
+        attempts: int = 3,
+    ) -> None:
+        last_error: PlaywrightError | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                await page.goto(url, wait_until=wait_until)
+                return
+            except PlaywrightError as exc:
+                last_error = exc
+                if attempt >= attempts or not self._is_retryable_navigation_error(exc):
+                    raise
+                LOGGER.warning(
+                    "页面跳转失败，准备重试 attempt=%s/%s url=%s error=%s",
+                    attempt,
+                    attempts,
+                    url,
+                    exc,
+                )
+                await asyncio.sleep(attempt)
+
+        if last_error is not None:
+            raise last_error
+
+    def _is_retryable_navigation_error(self, error: BaseException) -> bool:
+        message = str(error)
+        return any(
+            marker in message
+            for marker in (
+                "ERR_NETWORK_CHANGED",
+                "ERR_ABORTED",
+                "ERR_INTERNET_DISCONNECTED",
+                "ERR_CONNECTION_RESET",
+            )
+        )
 
     async def _safe_text(self, locator: Locator) -> str:
         try:

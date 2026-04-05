@@ -165,3 +165,45 @@ def test_panel_context_options_ignore_https_errors():
     client = LazyCatPanelClient(settings)
     options = client._build_context_options()
     assert options["ignore_https_errors"] is True
+
+
+def test_service_detail_href_detection():
+    settings = Settings(
+        api_token="secret-token",
+        app_host="0.0.0.0",
+        app_port=8080,
+        lazycat_base_url="https://lxc.lazycat.wiki",
+        lazycat_login_path="/login",
+        lazycat_clientarea_path="/clientarea",
+        lazycat_email="user@example.com",
+        lazycat_password="password",
+        lazycat_target_hostname="",
+        restart_cooldown_seconds=300,
+        stop_wait_seconds=5,
+        browser_timeout_ms=30000,
+        playwright_headless=True,
+        storage_state_path=Path("data/test-storage-state.json"),
+        artifact_dir=Path("data/test-artifacts"),
+        enter_panel_texts=("进入面板",),
+        enter_panel_selectors=tuple(),
+        stop_button_texts=("停止", "关机"),
+        stop_button_selectors=tuple(),
+        start_button_texts=("启动", "开机"),
+        start_button_selectors=tuple(),
+        confirm_button_texts=("确认", "确定"),
+        confirm_button_selectors=tuple(),
+        service_link_selectors=tuple(),
+        service_link_skip_texts=("首页",),
+    )
+    client = LazyCatPanelClient(settings)
+
+    assert client._is_service_detail_href("servicedetail?id=6061") is True
+    assert client._is_service_detail_href("/servicedetail?id=6061") is True
+    assert (
+        client._is_service_detail_href(
+            "https://lxc.lazycat.wiki/clientarea?action=productdetails&id=6061",
+        )
+        is True
+    )
+    assert client._is_service_detail_href("/clientarea") is False
+    assert client._is_service_detail_href("https://example.com/servicedetail?id=6061") is False
