@@ -33,11 +33,7 @@ class LazyCatPanelClient:
                 headless=self._settings.playwright_headless,
                 args=["--disable-dev-shm-usage", "--no-sandbox"],
             )
-            context = await browser.new_context(
-                storage_state=str(self._settings.storage_state_path)
-                if self._settings.storage_state_path.exists()
-                else None,
-            )
+            context = await browser.new_context(**self._build_context_options())
             context.set_default_timeout(self._settings.browser_timeout_ms)
             page = await context.new_page()
             self._register_dialog_handler(page)
@@ -48,7 +44,7 @@ class LazyCatPanelClient:
                     page,
                     instance_name or self._settings.lazycat_target_hostname or None,
                 )
-                await self._power_cycle(target_page)
+                await self._power_cycle(target_page, fallback_page=page)
                 await context.storage_state(path=str(self._settings.storage_state_path))
                 screenshot = await self._capture_screenshot(target_page, f"{timestamp}-after-restart")
                 return {
@@ -64,6 +60,12 @@ class LazyCatPanelClient:
             finally:
                 await context.close()
                 await browser.close()
+
+    def _build_context_options(self) -> dict[str, object]:
+        options: dict[str, object] = {"ignore_https_errors": True}
+        if self._settings.storage_state_path.exists():
+            options["storage_state"] = str(self._settings.storage_state_path)
+        return options
 
     async def _ensure_logged_in(self, page: Page) -> None:
         await page.goto(self._abs_url(self._settings.lazycat_clientarea_path), wait_until="domcontentloaded")
@@ -146,39 +148,99 @@ class LazyCatPanelClient:
         await page.wait_for_load_state("networkidle")
         return page
 
-    async def _power_cycle(self, page: Page) -> None:
-        stop_locator = await self._find_clickable_by_rules(
+    async def _power_cycle(self, page: Page, fallback_page: Page | None = None) -> None:
+        stop_locator = await self._wait_for_clickable_by_rules(
             page,
             selectors=self._settings.stop_button_selectors,
             texts=self._settings.stop_button_texts,
         )
         if stop_locator is None:
-            raise RuntimeError("实例面板中未找到停止按钮，请补充停止按钮选择器。")
+            if fallback_page is not None and fallback_page is not page:
+                LOGGER.warning(
+                    "面板页未找到停止按钮，回退到产品详情页控制菜单。panel_url=%s detail_url=%s",
+                    page.url,
+                    fallback_page.url,
+                )
+                if await self._try_power_cycle_from_service_detail(fallback_page):
+                    return
+            raise RuntimeError(
+                "实例面板中未找到停止按钮，请补充停止按钮选择器。"
+                f" 当前页面: {await self._describe_page(page)}",
+            )
         await stop_locator.click()
         await asyncio.sleep(1)
         await self._click_confirm_if_present(page)
         await asyncio.sleep(self._settings.stop_wait_seconds)
 
-        start_locator = await self._find_clickable_by_rules(
+        start_locator = await self._wait_for_clickable_by_rules(
             page,
             selectors=self._settings.start_button_selectors,
             texts=self._settings.start_button_texts,
         )
         if start_locator is None:
-            raise RuntimeError("实例面板中未找到启动按钮，请补充启动按钮选择器。")
+            raise RuntimeError(
+                "实例面板中未找到启动按钮，请补充启动按钮选择器。"
+                f" 当前页面: {await self._describe_page(page)}",
+            )
         await start_locator.click()
         await asyncio.sleep(1)
         await self._click_confirm_if_present(page)
         await page.wait_for_load_state("networkidle")
 
     async def _click_confirm_if_present(self, page: Page) -> None:
-        locator = await self._find_clickable_by_rules(
+        locator = await self._wait_for_clickable_by_rules(
             page,
             selectors=self._settings.confirm_button_selectors,
             texts=self._settings.confirm_button_texts,
+            timeout_ms=2500,
         )
         if locator is not None:
             await locator.click()
+
+    async def _try_power_cycle_from_service_detail(self, page: Page) -> bool:
+        control_button = await self._wait_for_clickable_by_rules(
+            page,
+            selectors=tuple(),
+            texts=("控制",),
+            timeout_ms=5000,
+        )
+        if control_button is None:
+            return False
+
+        await control_button.click()
+        await asyncio.sleep(0.5)
+
+        stop_locator = await self._wait_for_clickable_by_rules(
+            page,
+            selectors=self._settings.stop_button_selectors,
+            texts=self._settings.stop_button_texts,
+            timeout_ms=5000,
+        )
+        if stop_locator is None:
+            return False
+
+        await stop_locator.click()
+        await asyncio.sleep(1)
+        await self._click_confirm_if_present(page)
+        await asyncio.sleep(self._settings.stop_wait_seconds)
+
+        await control_button.click()
+        await asyncio.sleep(0.5)
+
+        start_locator = await self._wait_for_clickable_by_rules(
+            page,
+            selectors=self._settings.start_button_selectors,
+            texts=self._settings.start_button_texts,
+            timeout_ms=5000,
+        )
+        if start_locator is None:
+            return False
+
+        await start_locator.click()
+        await asyncio.sleep(1)
+        await self._click_confirm_if_present(page)
+        await page.wait_for_load_state("networkidle")
+        return True
 
     async def _find_clickable_by_rules(
         self,
@@ -192,6 +254,30 @@ class LazyCatPanelClient:
             if locator is not None:
                 return locator
         return await self._find_clickable_by_text(page, texts)
+
+    async def _wait_for_clickable_by_rules(
+        self,
+        page: Page,
+        *,
+        selectors: Iterable[str],
+        texts: Iterable[str],
+        timeout_ms: int | None = None,
+        poll_interval_ms: int = 500,
+    ) -> Locator | None:
+        deadline = asyncio.get_running_loop().time() + (
+            (timeout_ms or self._settings.browser_timeout_ms) / 1000
+        )
+        while True:
+            locator = await self._find_clickable_by_rules(
+                page,
+                selectors=selectors,
+                texts=texts,
+            )
+            if locator is not None:
+                return locator
+            if asyncio.get_running_loop().time() >= deadline:
+                return None
+            await asyncio.sleep(poll_interval_ms / 1000)
 
     async def _find_first_visible_by_selector(self, page: Page, selector: str) -> Locator | None:
         for frame in page.frames:
@@ -282,6 +368,22 @@ class LazyCatPanelClient:
         except Exception:  # noqa: BLE001
             return ""
         return " ".join(text.split()).strip()
+
+    async def _describe_page(self, page: Page) -> str:
+        title = ""
+        try:
+            title = await page.title()
+        except Exception:  # noqa: BLE001
+            title = ""
+
+        text = ""
+        try:
+            text = await page.locator("body").inner_text(timeout=2000)
+        except Exception:  # noqa: BLE001
+            text = ""
+
+        summary = " ".join(text.split())[:200]
+        return f"url={page.url}, title={title}, text={summary}"
 
     def _register_dialog_handler(self, page: Page) -> None:
         async def accept_dialog(dialog) -> None:
