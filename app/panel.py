@@ -78,14 +78,15 @@ class LazyCatPanelClient:
 
     async def _login(self, page: Page) -> None:
         await page.goto(self._abs_url(self._settings.lazycat_login_path), wait_until="domcontentloaded")
+        await page.locator("#emailInp").wait_for(state="visible")
         await page.locator("#emailInp").fill(self._settings.lazycat_email)
         await page.locator("#emailPwdInp").fill(self._settings.lazycat_password)
         await page.locator("#loginButton").click()
-        await page.wait_for_load_state("networkidle")
+        await self._wait_for_login_completion(page)
 
     async def _open_target_panel(self, page: Page, instance_name: str | None) -> tuple[Page, str | None]:
         await page.goto(self._abs_url(self._settings.lazycat_clientarea_path), wait_until="domcontentloaded")
-        await page.wait_for_load_state("networkidle")
+        await self._wait_for_page_settle(page)
 
         panel_page = await self._click_panel_entry_if_present(page)
         if panel_page is not None:
@@ -103,16 +104,21 @@ class LazyCatPanelClient:
             if locator is not None:
                 text = await self._safe_text(locator)
                 await locator.click()
-                await page.wait_for_load_state("networkidle")
+                await self._wait_for_page_settle(page)
                 return text or instance_name
 
         if instance_name:
-            locator = await self._find_clickable_by_text(page, (instance_name,))
+            locator = await self._wait_for_clickable_by_rules(
+                page,
+                selectors=tuple(),
+                texts=(instance_name,),
+                timeout_ms=10000,
+            )
             if locator is None:
                 raise RuntimeError(f"资源列表中未找到实例名: {instance_name}")
             resolved_name = await self._safe_text(locator) or instance_name
             await locator.click()
-            await page.wait_for_load_state("networkidle")
+            await self._wait_for_page_settle(page)
             return resolved_name
 
         candidates = await self._collect_service_link_candidates(page)
@@ -123,7 +129,7 @@ class LazyCatPanelClient:
             )
 
         await candidates[0]["locator"].click()
-        await page.wait_for_load_state("networkidle")
+        await self._wait_for_page_settle(page)
         return candidates[0]["text"]
 
     async def _click_panel_entry_if_present(self, page: Page) -> Page | None:
@@ -142,10 +148,10 @@ class LazyCatPanelClient:
         if after_pages:
             panel_page = after_pages[-1]
             self._register_dialog_handler(panel_page)
-            await panel_page.wait_for_load_state("networkidle")
+            await self._wait_for_page_settle(panel_page)
             return panel_page
 
-        await page.wait_for_load_state("networkidle")
+        await self._wait_for_page_settle(page)
         return page
 
     async def _power_cycle(self, page: Page, fallback_page: Page | None = None) -> None:
@@ -185,7 +191,7 @@ class LazyCatPanelClient:
         await start_locator.click()
         await asyncio.sleep(1)
         await self._click_confirm_if_present(page)
-        await page.wait_for_load_state("networkidle")
+        await self._wait_for_page_settle(page)
 
     async def _click_confirm_if_present(self, page: Page) -> None:
         locator = await self._wait_for_clickable_by_rules(
@@ -239,7 +245,7 @@ class LazyCatPanelClient:
         await start_locator.click()
         await asyncio.sleep(1)
         await self._click_confirm_if_present(page)
-        await page.wait_for_load_state("networkidle")
+        await self._wait_for_page_settle(page)
         return True
 
     async def _find_clickable_by_rules(
@@ -361,6 +367,54 @@ class LazyCatPanelClient:
             return await page.locator("#loginButton").is_visible()
         except PlaywrightTimeoutError:
             return False
+
+    async def _has_logged_in_marker(self, page: Page) -> bool:
+        if self._settings.lazycat_login_path not in page.url and self._settings.lazycat_base_url in page.url:
+            try:
+                if await page.locator("#page-header-user-dropdown").is_visible():
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+
+            try:
+                if await page.locator("a[href*='servicedetail?id=']").count() > 0:
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+
+            try:
+                if await page.locator("a[href*='logout']").count() > 0:
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+
+        return False
+
+    async def _wait_for_login_completion(self, page: Page) -> None:
+        deadline = asyncio.get_running_loop().time() + (self._settings.browser_timeout_ms / 1000)
+        while True:
+            if await self._has_logged_in_marker(page):
+                return
+
+            if not await self._is_login_page(page):
+                await self._wait_for_page_settle(page)
+                if await self._has_logged_in_marker(page):
+                    return
+
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError(
+                    "登录后等待页面完成超时。"
+                    f" 当前页面: {await self._describe_page(page)}"
+                )
+
+            await asyncio.sleep(0.5)
+
+    async def _wait_for_page_settle(self, page: Page, timeout_ms: int = 10000) -> None:
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        except PlaywrightTimeoutError:
+            pass
+        await asyncio.sleep(1)
 
     async def _safe_text(self, locator: Locator) -> str:
         try:
