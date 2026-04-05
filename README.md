@@ -72,6 +72,13 @@ X-Api-Token: your-token
 Content-Type: application/json
 ```
 
+也兼容下面这种第三方 webhook 常见写法：
+
+```http
+api_key: your-token
+Content-Type: application/json
+```
+
 请求体示例：
 
 ```json

@@ -119,3 +119,15 @@ def test_get_job():
     response = client.get("/api/v1/jobs/job-1", headers={"X-Api-Token": "secret-token"})
     assert response.status_code == 200
     assert response.json()["job"]["id"] == "job-1"
+
+
+def test_status_report_accepts_api_key_header():
+    client, manager = build_client()
+    response = client.post(
+        "/api/v1/vps/status",
+        headers={"api_key": "secret-token"},
+        json={"status": "offline", "instance_name": "demo-vps", "source": "webhook"},
+    )
+    assert response.status_code == 200
+    assert response.json()["accepted"] is True
+    assert manager.calls[0]["source"] == "webhook"

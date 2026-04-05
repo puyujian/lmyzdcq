@@ -130,7 +130,11 @@ async def require_api_token(
     if not expected:
         return
 
-    actual = x_api_token
+    actual = (
+        x_api_token
+        or request.headers.get("api_key")
+        or request.headers.get("api-key")
+    )
     if not actual and authorization and authorization.lower().startswith("bearer "):
         actual = authorization[7:].strip()
 
