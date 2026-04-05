@@ -79,6 +79,67 @@ api_key: your-token
 Content-Type: application/json
 ```
 
+#### 第三方 Webhook 平台配置示例
+
+如果你的告警平台配置项是下面这种格式：
+
+```text
+接口地址
+请求头[header]
+请求体[body]
+```
+
+那就这样填：
+
+接口地址：
+
+```text
+https://your-domain-url/api/v1/vps/status
+```
+
+请求方法：
+
+```text
+POST
+```
+
+请求头 `header`：
+
+```json
+{
+  "api_key": "{{API_KEY}}",
+  "Content-Type": "application/json"
+}
+```
+
+请求体 `body`：
+
+```json
+{
+  "status": "{{CONTENT}}",
+  "source": "{{FROM}}",
+  "instance_name": "my-vps-01"
+}
+```
+
+字段填写说明：
+
+- `https://your-domain-url`：替换成你的服务域名，或者 `http://服务器IP:端口`
+- `{{API_KEY}}`：替换成 `docker-compose.yml` 里的 `API_TOKEN`
+- `{{CONTENT}}`：建议传 `offline`、`down`、`off`、`shutdown`、`stopped`、`powered_off` 这些值之一
+- `{{FROM}}`：替换成告警来源，比如 `uptime-kuma`、`zabbix`、`webhook`
+- `instance_name`：替换成懒猫云里这台 VPS 的主机名；如果当前只有一台，也可以不传，改为在 `docker-compose.yml` 里固定 `LAZYCAT_TARGET_HOSTNAME`
+
+一个完整可直接用的示例：
+
+```json
+{
+  "status": "offline",
+  "source": "uptime-kuma",
+  "instance_name": "my-vps-01"
+}
+```
+
 请求体示例：
 
 ```json
@@ -110,6 +171,29 @@ Content-Type: application/json
 POST /api/v1/vps/restart
 X-Api-Token: your-token
 Content-Type: application/json
+```
+
+如果你要从外部平台直接手动触发重启，可以这样调用：
+
+接口地址：
+
+```text
+https://your-domain-url/api/v1/vps/restart
+```
+
+请求方法：
+
+```text
+POST
+```
+
+请求头 `header`：
+
+```json
+{
+  "api_key": "{{API_KEY}}",
+  "Content-Type": "application/json"
+}
 ```
 
 ```json
